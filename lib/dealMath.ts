@@ -1,34 +1,27 @@
 /**
  * Deal calculation logic for the in-app settlement tool.
  *
- * IMPORTANT — DELIBERATELY INCOMPLETE.
+ * Supported deal types:
+ *   - flat
+ *   - percentage_of_gross
+ *   - vs (guarantee vs % of net or gross, with walkout/ratchet from prose)
  *
- * This is the existing Greenroom settlement engine. It was built early in
- * the company's life, when most deals were flat guarantees. It currently
- * handles two deal types end-to-end:
- *
- *   1. flat                 — $X guaranteed, optional sellout bonus
- *   2. percentage_of_gross  — X% of gross, no expense deductions, optional sellout bonus
- *
- * For both, it reads `bonusesJson` and applies bonuses where it can — but
- * only the structured ones. Bonuses that exist only in `dealNotesFreetext`
- * are invisible to this engine.
- *
- * It does NOT handle:
- *
- *   - vs deals (guarantee vs % of net, whichever greater)
- *   - percentage_of_net deals (with expense deductions)
- *   - door deals
- *   - recoups (those flow separately through the settlement record)
- *   - tier ratchets (would need vs-deal support first)
- *   - comps that count toward gross
- *
- * For unsupported deals, the tool returns { supported: false } and the UI
- * shows the "this deal type isn't yet supported" empty state. About 82% of
- * Greenroom's customers default to spreadsheets because of this.
+ * Still unsupported: percentage_of_net, door, comps affecting gross.
  */
 
-import type { Deal, Expense, TicketSale, Bonus } from "@/db/schema";
+import type { Deal, Expense, TicketSale, Bonus, Recoup, Settlement } from "@/db/schema";
+import {
+  parseDealNotes,
+  detectStaleStructuredFields,
+  type ParsedNoteBonus,
+} from "@/lib/parseDealNotes";
+
+export type AuditTrailEntry = {
+  step: number;
+  label: string;
+  value: number;
+  explanation: string;
+};
 
 export type SettlementCalculation =
   | {
@@ -39,11 +32,11 @@ export type SettlementCalculation =
       totalToArtist: number;
       steps: { label: string; value: number; note?: string }[];
       finalFormula: string;
-      // Bonuses that were applied. Empty array if no bonuses on the deal,
-      // or if no bonuses triggered.
       bonusesApplied: { label: string; amount: number; reason: string }[];
-      // Bonuses that exist on the deal but didn't trigger (helpful context).
       bonusesNotTriggered: { label: string; amount: number; reason: string }[];
+      auditTrail?: AuditTrailEntry[];
+      guaranteeWon?: boolean;
+      warnings?: string[];
     }
   | {
       supported: false;
@@ -51,14 +44,20 @@ export type SettlementCalculation =
       dealType: Deal["dealType"];
     };
 
-interface CalcInput {
+/** Optional settlement row fields used for warnings (show may have no settlement yet). */
+export type SettlementCalcMeta = Pick<
+  Settlement,
+  "status" | "signoffText" | "totalToArtist"
+>;
+
+export interface CalcInput {
   deal: Deal;
   ticketSales: TicketSale[];
   expenses: Expense[];
-  // Capacity is needed to evaluate sellout bonuses. Optional — if omitted,
-  // sellout bonuses are reported as "can't determine".
   venueCapacity?: number;
   ticketsSold?: number;
+  recoups?: Recoup[];
+  settlement?: SettlementCalcMeta | null;
 }
 
 export function parseBonuses(deal: Deal): Bonus[] {
@@ -69,6 +68,400 @@ export function parseBonuses(deal: Deal): Bonus[] {
   } catch {
     return [];
   }
+}
+
+function noteBonusesToStructured(notes: ParsedNoteBonus[]): Bonus[] {
+  return notes.map((b) => {
+    if (b.type === "gross_threshold") {
+      return {
+        type: "gross_threshold" as const,
+        label: b.label,
+        threshold: b.threshold,
+        amount: b.amount,
+      };
+    }
+    if (b.type === "attendance_threshold") {
+      return {
+        type: "attendance_threshold" as const,
+        label: b.label,
+        threshold: b.threshold,
+        amount: b.amount,
+      };
+    }
+    return { type: "sellout" as const, label: b.label, amount: b.amount };
+  });
+}
+
+function isWalkoutBonus(b: Bonus): boolean {
+  return (
+    b.type === "gross_threshold" &&
+    /walkout/i.test(b.label)
+  );
+}
+
+function percentageFromTierRatchet(
+  bonus: Extract<Bonus, { type: "tier_ratchet" }>,
+  fillRatio: number,
+): number {
+  for (const tier of bonus.tiers) {
+    const upper = tier.to ?? Infinity;
+    if (fillRatio >= tier.from && fillRatio < upper) {
+      return tier.percentage;
+    }
+  }
+  return bonus.tiers[bonus.tiers.length - 1]!.percentage;
+}
+
+function resolveVsPercentage(
+  deal: Deal,
+  structuredBonuses: Bonus[],
+  parsedNotes: ReturnType<typeof parseDealNotes>,
+  fillRatio: number | null,
+): { percentage: number; explanation?: string } {
+  let pct = deal.percentage!;
+  let explanation: string | undefined;
+
+  if (parsedNotes.ratchet && fillRatio != null) {
+    const threshold = parsedNotes.ratchet.capacityThreshold;
+    const base = Number.isNaN(parsedNotes.ratchet.basePercent)
+      ? pct
+      : parsedNotes.ratchet.basePercent;
+    if (fillRatio >= threshold) {
+      pct = parsedNotes.ratchet.escalatedPercent;
+      explanation = `Ratchet active (${(fillRatio * 100).toFixed(0)}% capacity ≥ ${(threshold * 100).toFixed(0)}%) — using ${(pct * 100).toFixed(0)}%`;
+    } else {
+      pct = base;
+      explanation = `Base rate ${(pct * 100).toFixed(0)}% (${(fillRatio * 100).toFixed(0)}% capacity sold)`;
+    }
+  }
+
+  const tierRatchet = structuredBonuses.find(
+    (b): b is Extract<Bonus, { type: "tier_ratchet" }> => b.type === "tier_ratchet",
+  );
+  if (tierRatchet && fillRatio != null) {
+    pct = percentageFromTierRatchet(tierRatchet, fillRatio);
+    explanation = `Tier ratchet — ${(pct * 100).toFixed(0)}% at ${(fillRatio * 100).toFixed(0)}% capacity sold`;
+  }
+
+  return { percentage: pct, explanation };
+}
+
+function resolveWalkoutAmount(
+  grossBoxOffice: number,
+  deal: Deal,
+  parsedNotes: ReturnType<typeof parseDealNotes>,
+  structuredBonuses: Bonus[],
+  cappedExpenses: number,
+): { amount: number; explanation: string } {
+  if (parsedNotes.walkout) {
+    const threshold =
+      parsedNotes.walkout.kind === "threshold"
+        ? parsedNotes.walkout.threshold
+        : (deal.guaranteeAmount ?? 0) + cappedExpenses;
+    const amount = Math.max(0, grossBoxOffice - threshold);
+    return {
+      amount,
+      explanation:
+        parsedNotes.walkout.kind === "breakeven"
+          ? `Walkout above breakeven ($${threshold.toLocaleString()} = guarantee + expenses)`
+          : `100% of gross above $${threshold.toLocaleString()}`,
+    };
+  }
+
+  const walkoutBonus = structuredBonuses.find(isWalkoutBonus);
+  if (walkoutBonus && walkoutBonus.type === "gross_threshold") {
+    const amount = Math.max(0, grossBoxOffice - walkoutBonus.threshold);
+    return {
+      amount,
+      explanation: walkoutBonus.label,
+    };
+  }
+
+  return { amount: 0, explanation: "" };
+}
+
+function buildWarnings(
+  input: CalcInput,
+  totalToArtist: number,
+  rawExpenseTotal: number,
+  cappedExpenses: number,
+  approvedExpenses: Expense[],
+  parsedNotes: ReturnType<typeof parseDealNotes>,
+): string[] {
+  const warnings: string[] = [];
+  const { deal, recoups = [], settlement } = input;
+
+  if (deal.expenseCap != null && rawExpenseTotal > deal.expenseCap) {
+    warnings.push(
+      `Approved expenses ($${rawExpenseTotal.toLocaleString()}) exceed the $${deal.expenseCap.toLocaleString()} cap — capped at $${cappedExpenses.toLocaleString()} for settlement.`,
+    );
+  }
+
+  const hospitalityCap =
+    deal.hospitalityCap ?? parsedNotes.hospitalityCap ?? null;
+  if (hospitalityCap != null) {
+    const hospitalitySpend = approvedExpenses
+      .filter((e) => e.category === "hospitality")
+      .reduce((s, e) => s + e.amount, 0);
+    if (hospitalitySpend > hospitalityCap) {
+      warnings.push(
+        `Hospitality spend ($${hospitalitySpend.toLocaleString()}) exceeds the $${hospitalityCap.toLocaleString()} rider cap — venue may be absorbing the difference.`,
+      );
+    }
+  }
+
+  const disputed = recoups.filter((r) => r.status === "disputed");
+  for (const r of disputed) {
+    warnings.push(
+      `Disputed recoup: ${r.label} ($${r.amount.toLocaleString()}) — not included in total until resolved.`,
+    );
+  }
+
+  if (settlement != null) {
+    const signedLike = ["signed", "finalized", "paid"].includes(settlement.status);
+    if (signedLike && !settlement.signoffText?.trim()) {
+      warnings.push(
+        `Settlement status is "${settlement.status}" but no artist sign-off text is on file.`,
+      );
+    }
+    if (
+      settlement.status === "disputed" &&
+      settlement.signoffText?.trim() &&
+      /\b(ok|okay|looks good|approved|fine|agreed)\b/i.test(settlement.signoffText)
+    ) {
+      warnings.push(
+        `Status is disputed but sign-off text reads positive ("${settlement.signoffText.slice(0, 60)}${settlement.signoffText.length > 60 ? "…" : ""}") — reconcile before finalizing.`,
+      );
+    }
+    if (
+      settlement.totalToArtist != null &&
+      Math.abs(settlement.totalToArtist - totalToArtist) > 0.5
+    ) {
+      warnings.push(
+        `Logged settlement ($${settlement.totalToArtist.toLocaleString()}) differs from calculated total ($${totalToArtist.toLocaleString()}).`,
+      );
+    }
+  }
+
+  for (const flag of detectStaleStructuredFields(
+    deal.dealNotesFreetext,
+    !!deal.bonusesJson,
+    parsedNotes,
+  )) {
+    warnings.push(flag);
+  }
+
+  return warnings;
+}
+
+function auditToSteps(
+  trail: AuditTrailEntry[],
+): { label: string; value: number; note?: string }[] {
+  return trail.map((e) => ({
+    label: e.label,
+    value: e.value,
+    note: e.explanation,
+  }));
+}
+
+function calculateVsDeal(
+  input: CalcInput,
+  grossBoxOffice: number,
+  totalFees: number,
+  netBoxOffice: number,
+): SettlementCalculation {
+  const { deal, ticketSales, expenses, venueCapacity, ticketsSold, recoups = [] } =
+    input;
+
+  if (deal.guaranteeAmount == null || deal.percentage == null) {
+    return {
+      supported: false,
+      reason: "Vs deal is missing a guarantee or percentage.",
+      dealType: deal.dealType,
+    };
+  }
+
+  const basis = deal.percentageBasis ?? "net";
+  const tickets =
+    ticketsSold ?? ticketSales.reduce((sum, t) => sum + (t.qty ?? 0), 0);
+  const fillRatio =
+    venueCapacity != null && venueCapacity > 0 ? tickets / venueCapacity : null;
+
+  const approvedExpenses = expenses.filter(
+    (e) => e.approved && !e.absorbedByVenue,
+  );
+  const rawExpenseTotal = approvedExpenses.reduce((s, e) => s + e.amount, 0);
+  const cappedExpenses =
+    deal.expenseCap != null
+      ? Math.min(rawExpenseTotal, deal.expenseCap)
+      : rawExpenseTotal;
+
+  const parsedNotes = parseDealNotes(deal.dealNotesFreetext);
+  const structuredBonuses = parseBonuses(deal);
+  const { percentage: effectivePct, explanation: pctNote } = resolveVsPercentage(
+    deal,
+    structuredBonuses,
+    parsedNotes,
+    fillRatio,
+  );
+
+  const auditTrail: AuditTrailEntry[] = [];
+  let step = 1;
+
+  auditTrail.push({
+    step: step++,
+    label: "Gross box office",
+    value: grossBoxOffice,
+    explanation: "Sum of ticket sales gross",
+  });
+
+  auditTrail.push({
+    step: step++,
+    label: "Platform & CC fees",
+    value: -totalFees,
+    explanation: "Deducted from gross to reach net after fees",
+  });
+
+  auditTrail.push({
+    step: step++,
+    label: "Net after fees",
+    value: netBoxOffice,
+    explanation: `${grossBoxOffice.toLocaleString()} − ${totalFees.toLocaleString()}`,
+  });
+
+  let percentageBasisAmount: number;
+  if (basis === "gross") {
+    percentageBasisAmount = grossBoxOffice;
+    auditTrail.push({
+      step: step++,
+      label: "Percentage basis (gross)",
+      value: percentageBasisAmount,
+      explanation: "Vs-gross deal — no expense deductions before percentage",
+    });
+  } else {
+    auditTrail.push({
+      step: step++,
+      label: "Approved expenses",
+      value: -cappedExpenses,
+      explanation:
+        deal.expenseCap != null
+          ? `Passed-through expenses, capped at $${deal.expenseCap.toLocaleString()} (raw: $${rawExpenseTotal.toLocaleString()})`
+          : `Passed-through expenses (${rawExpenseTotal.toLocaleString()})`,
+    });
+    percentageBasisAmount = netBoxOffice - cappedExpenses;
+    auditTrail.push({
+      step: step++,
+      label: "Net after expenses",
+      value: percentageBasisAmount,
+      explanation: `${netBoxOffice.toLocaleString()} − ${cappedExpenses.toLocaleString()}`,
+    });
+  }
+
+  const percentageAmount = percentageBasisAmount * effectivePct;
+  auditTrail.push({
+    step: step++,
+    label: `× ${(effectivePct * 100).toFixed(0)}%`,
+    value: percentageAmount,
+    explanation: pctNote ?? `${(effectivePct * 100).toFixed(0)}% of ${basis}`,
+  });
+
+  const guarantee = deal.guaranteeAmount;
+  const vsBase = Math.max(guarantee, percentageAmount);
+  const guaranteeWon = vsBase === guarantee;
+
+  auditTrail.push({
+    step: step++,
+    label: guaranteeWon ? "Guarantee (vs winner)" : "Percentage (vs winner)",
+    value: vsBase,
+    explanation: guaranteeWon
+      ? `Guarantee $${guarantee.toLocaleString()} beats ${percentageAmount.toLocaleString()} (${(effectivePct * 100).toFixed(0)}% of ${basis})`
+      : `${(effectivePct * 100).toFixed(0)}% of ${basis} (${percentageAmount.toLocaleString()}) beats guarantee $${guarantee.toLocaleString()}`,
+  });
+
+  const payableBonuses = structuredBonuses.filter((b) => !isWalkoutBonus(b));
+  const noteBonusStructs = noteBonusesToStructured(parsedNotes.noteBonuses);
+  const bonusResult = applyBonuses(
+    [...payableBonuses, ...noteBonusStructs],
+    { gross: grossBoxOffice, tickets, capacity: venueCapacity },
+    { includeTierRatchet: false },
+  );
+
+  if (bonusResult.totalApplied > 0) {
+    auditTrail.push({
+      step: step++,
+      label: "Bonuses",
+      value: bonusResult.totalApplied,
+      explanation: bonusResult.applied.map((b) => b.reason).join("; "),
+    });
+  }
+
+  const walkout = resolveWalkoutAmount(
+    grossBoxOffice,
+    deal,
+    parsedNotes,
+    structuredBonuses,
+    cappedExpenses,
+  );
+  if (walkout.amount > 0) {
+    auditTrail.push({
+      step: step++,
+      label: "Walkout pot",
+      value: walkout.amount,
+      explanation: walkout.explanation,
+    });
+  }
+
+  const subtotal = vsBase + bonusResult.totalApplied + walkout.amount;
+
+  const agreedRecoups = recoups.filter((r) => r.status === "agreed");
+  const recoupTotal = agreedRecoups.reduce((s, r) => s + r.amount, 0);
+  if (recoupTotal > 0) {
+    auditTrail.push({
+      step: step++,
+      label: "Recoups (agreed)",
+      value: -recoupTotal,
+      explanation: agreedRecoups.map((r) => `${r.label}: $${r.amount}`).join("; "),
+    });
+  }
+
+  const totalToArtist = subtotal - recoupTotal;
+  auditTrail.push({
+    step: step++,
+    label: "Total to artist",
+    value: totalToArtist,
+    explanation: "Vs base + bonuses + walkout − agreed recoups",
+  });
+
+  const warnings = buildWarnings(
+    input,
+    totalToArtist,
+    rawExpenseTotal,
+    cappedExpenses,
+    approvedExpenses,
+    parsedNotes,
+  );
+
+  const parts = [
+    guaranteeWon ? `g'tee ${guarantee}` : `${(effectivePct * 100).toFixed(0)}% ${basis}`,
+  ];
+  if (bonusResult.totalApplied) parts.push(`+bonuses ${bonusResult.totalApplied}`);
+  if (walkout.amount) parts.push(`+walkout ${walkout.amount}`);
+  if (recoupTotal) parts.push(`−recoups ${recoupTotal}`);
+
+  return {
+    supported: true,
+    grossBoxOffice,
+    netBoxOffice,
+    totalExpenses: cappedExpenses,
+    totalToArtist,
+    steps: auditToSteps(auditTrail),
+    finalFormula: `${parts.join(" ")} = ${totalToArtist.toFixed(2)}`,
+    bonusesApplied: bonusResult.applied,
+    bonusesNotTriggered: bonusResult.notTriggered,
+    auditTrail,
+    guaranteeWon,
+    warnings: warnings.length > 0 ? warnings : undefined,
+  };
 }
 
 export function calculateSettlement(input: CalcInput): SettlementCalculation {
@@ -83,6 +476,10 @@ export function calculateSettlement(input: CalcInput): SettlementCalculation {
 
   const tickets =
     ticketsSold ?? ticketSales.reduce((sum, t) => sum + (t.qty ?? 0), 0);
+
+  if (deal.dealType === "vs") {
+    return calculateVsDeal(input, grossBoxOffice, totalFees, netBoxOffice);
+  }
 
   // ---------- flat guarantee ----------
   if (deal.dealType === "flat") {
@@ -124,6 +521,7 @@ export function calculateSettlement(input: CalcInput): SettlementCalculation {
       bonusesNotTriggered: bonusResult.notTriggered,
     };
   }
+
 
   // ---------- percentage of gross ----------
   if (deal.dealType === "percentage_of_gross") {
@@ -168,7 +566,6 @@ export function calculateSettlement(input: CalcInput): SettlementCalculation {
     };
   }
 
-  // ---------- everything else: not supported ----------
   const friendlyName: Record<Deal["dealType"], string> = {
     flat: "Flat guarantee",
     percentage_of_gross: "Percentage of gross",
@@ -190,11 +587,17 @@ export function calculateSettlement(input: CalcInput): SettlementCalculation {
 function applyBonuses(
   bonuses: Bonus[],
   ctx: { gross: number; tickets: number; capacity?: number },
+  opts?: { includeTierRatchet?: boolean },
 ) {
+  const includeTierRatchet = opts?.includeTierRatchet ?? true;
   const applied: { label: string; amount: number; reason: string }[] = [];
   const notTriggered: { label: string; amount: number; reason: string }[] = [];
 
   for (const b of bonuses) {
+    if (isWalkoutBonus(b)) {
+      continue;
+    }
+
     if (b.type === "gross_threshold") {
       if (ctx.gross >= b.threshold) {
         applied.push({
@@ -241,10 +644,14 @@ function applyBonuses(
         });
       }
     } else if (b.type === "tier_ratchet") {
-      // Tier ratchets fundamentally change the percentage structure. The
-      // current engine only supports flat % of gross — we can't apply a
-      // ratcheting structure on top of it without knowing which deal type
-      // it's modifying. Report as not-applicable.
+      if (!includeTierRatchet) {
+        notTriggered.push({
+          label: b.label,
+          amount: 0,
+          reason: "Applied to percentage rate in vs calculation",
+        });
+        continue;
+      }
       notTriggered.push({
         label: b.label,
         amount: 0,

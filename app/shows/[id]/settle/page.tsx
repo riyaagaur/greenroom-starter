@@ -13,6 +13,8 @@ import {
   TrendingUp,
 } from "lucide-react";
 import { getShowById } from "@/lib/queries";
+import type { ShowWithRelations } from "@/lib/show-types";
+import type { CalcInput } from "@/lib/dealMath";
 import {
   Card,
   CardContent,
@@ -23,11 +25,12 @@ import {
 } from "@/components/ui/card";
 import { StatusBadge, DealTypeBadge, PlainBadge } from "@/components/ui/badge";
 import { calculateSettlement } from "@/lib/dealMath";
+import { VsSettlement } from "@/components/settlement/vs-settlement";
 import {
   formatMoney,
   formatShowDateFull,
 } from "@/lib/format";
-import type { Settlement, Recoup } from "@/db/schema";
+import type { Settlement, Recoup, Deal } from "@/db/schema";
 import { Logomark } from "@/components/brand/logo";
 
 const RECOUP_LABELS: Record<Recoup["category"], string> = {
@@ -45,11 +48,13 @@ export default async function SettlePage({
   params: Promise<{ id: string }>;
 }) {
   const { id } = await params;
-  const data = await getShowById(id);
+  const data = (await getShowById(id)) as ShowWithRelations | null;
   if (!data) notFound();
 
-  const { show, artist, deal, ticketSales, expenses, settlement, recoups } =
+  const { show, artist, deal, ticketSales, expenses, settlement, recoups, comps } =
     data;
+
+  const venueCapacity = data.venue?.capacity ?? 650;
 
   if (!deal) {
     return (
@@ -62,21 +67,34 @@ export default async function SettlePage({
     );
   }
 
+  const settlementMeta: CalcInput["settlement"] = settlement
+    ? {
+        status: settlement.status,
+        signoffText: settlement.signoffText,
+        totalToArtist: settlement.totalToArtist,
+      }
+    : null;
+
   const calc = calculateSettlement({
     deal,
     ticketSales,
     expenses,
-    venueCapacity: data.venue?.capacity ?? undefined,
+    venueCapacity,
+    recoups,
+    settlement: settlementMeta,
   });
-  const grossSoFar = ticketSales.reduce((sum, t) => sum + t.gross, 0);
-  const totalFees = ticketSales.reduce((sum, t) => sum + t.fees, 0);
+  const grossSoFar = ticketSales.reduce((sum: number, t) => sum + t.gross, 0);
+  const totalFees = ticketSales.reduce((sum: number, t) => sum + t.fees, 0);
   const totalExpenses = expenses
     .filter((e) => !e.absorbedByVenue)
-    .reduce((sum, e) => sum + e.amount, 0);
+    .reduce((sum: number, e) => sum + e.amount, 0);
 
   const disputedRecoups = recoups.filter((r) => r.status === "disputed");
   const isDisputed = settlement?.status === "disputed" || settlement?.status === "revised" || !!settlement?.disputedAt;
-  const disputedRecoupValue = disputedRecoups.reduce((s, r) => s + r.amount, 0);
+  const disputedRecoupValue = disputedRecoups.reduce(
+    (s: number, r) => s + r.amount,
+    0,
+  );
 
   return (
     <div className={`px-12 py-10 max-w-7xl ${isDisputed ? "bg-gradient-to-b from-rose-50/30 via-canvas to-canvas" : ""}`}>
@@ -127,7 +145,17 @@ export default async function SettlePage({
       )}
 
       <div className="space-y-6 mt-6">
-        {!calc.supported ? (
+        {deal.dealType === "vs" ? (
+          <VsSettlement
+            deal={deal}
+            ticketSales={ticketSales}
+            expenses={expenses}
+            recoups={recoups}
+            comps={comps}
+            settlement={settlement}
+            venueCapacity={venueCapacity}
+          />
+        ) : !calc.supported ? (
           <UnsupportedDeal
             dealType={calc.dealType}
             deal={deal}
@@ -135,7 +163,7 @@ export default async function SettlePage({
             grossSoFar={grossSoFar}
             totalFees={totalFees}
             totalExpenses={totalExpenses}
-            ticketCount={ticketSales.reduce((s, t) => s + (t.qty ?? 0), 0)}
+            ticketCount={ticketSales.reduce((s: number, t) => s + t.qty, 0)}
             expenseRowCount={expenses.length}
           />
         ) : (
@@ -365,11 +393,9 @@ function UnsupportedDeal({
   ticketCount,
   expenseRowCount,
 }: {
-  dealType: string;
-  deal: NonNullable<Awaited<ReturnType<typeof getShowById>>>["deal"];
-  existingSettlement: NonNullable<
-    Awaited<ReturnType<typeof getShowById>>
-  >["settlement"];
+  dealType: Deal["dealType"];
+  deal: Deal;
+  existingSettlement: ShowWithRelations["settlement"];
   grossSoFar: number;
   totalFees: number;
   totalExpenses: number;
@@ -493,12 +519,26 @@ function SupportedSettlement({
     ReturnType<typeof calculateSettlement>,
     { supported: true }
   >;
-  existingSettlement: NonNullable<
-    Awaited<ReturnType<typeof getShowById>>
-  >["settlement"];
+  existingSettlement: ShowWithRelations["settlement"];
 }) {
   return (
     <>
+      {calc.warnings && calc.warnings.length > 0 && (
+        <div className="rounded-lg border border-amber-200/60 bg-amber-50/40 p-5 flex gap-3">
+          <AlertTriangle className="h-4 w-4 text-amber-800 mt-0.5 shrink-0" />
+          <div>
+            <div className="text-[13px] font-semibold text-amber-900">
+              Settlement flags
+            </div>
+            <ul className="text-[12.5px] text-ink-600 mt-2 space-y-1.5 leading-relaxed list-disc pl-4">
+              {calc.warnings.map((w, i) => (
+                <li key={i}>{w}</li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
+
       {/* Hero number */}
       <div className="text-center py-10 mb-2">
         <div className="eyebrow text-[10px] text-ink-400 mb-3">Total to artist</div>

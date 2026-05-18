@@ -8,6 +8,7 @@ import {
   TrendingUp,
 } from "lucide-react";
 import { getShowById } from "@/lib/queries";
+import type { ShowWithRelations } from "@/lib/show-types";
 import {
   Card,
   CardContent,
@@ -43,7 +44,7 @@ export default async function ShowDetailPage({
   params: Promise<{ id: string }>;
 }) {
   const { id } = await params;
-  const data = await getShowById(id);
+  const data = (await getShowById(id)) as ShowWithRelations | null;
   if (!data) notFound();
 
   const {
@@ -58,20 +59,20 @@ export default async function ShowDetailPage({
     comps,
   } = data;
 
-  const grossSoFar = ticketSales.reduce((sum, t) => sum + t.gross, 0);
-  const totalFees = ticketSales.reduce((sum, t) => sum + t.fees, 0);
-  const totalTickets = ticketSales.reduce((sum, t) => sum + (t.qty ?? 0), 0);
+  const grossSoFar = ticketSales.reduce((sum: number, t) => sum + t.gross, 0);
+  const totalFees = ticketSales.reduce((sum: number, t) => sum + t.fees, 0);
+  const totalTickets = ticketSales.reduce((sum: number, t) => sum + t.qty, 0);
   const totalExpenses = expenses
     .filter((e) => !e.absorbedByVenue)
-    .reduce((sum, e) => sum + e.amount, 0);
+    .reduce((sum: number, e) => sum + e.amount, 0);
   const absorbedTotal = expenses
     .filter((e) => e.absorbedByVenue)
-    .reduce((sum, e) => sum + e.amount, 0);
+    .reduce((sum: number, e) => sum + e.amount, 0);
 
-  const totalCompCount = comps.reduce((s, c) => s + c.count, 0);
+  const totalCompCount = comps.reduce((s: number, c) => s + c.count, 0);
   const compsCountingTowardGross = comps
     .filter((c) => c.countsTowardGross)
-    .reduce((s, c) => s + c.count, 0);
+    .reduce((s: number, c) => s + c.count, 0);
 
   const bonuses = deal ? parseBonuses(deal) : [];
 

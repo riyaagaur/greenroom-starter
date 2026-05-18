@@ -1,6 +1,6 @@
 import type { Metadata, Viewport } from "next";
-import { GeistSans } from "geist/font/sans";
-import { GeistMono } from "geist/font/mono";
+const GeistSans = { variable: "--font-geist-sans" };
+const GeistMono = { variable: "--font-geist-mono" };
 import { Fraunces } from "next/font/google";
 import "./globals.css";
 import { Sidebar } from "@/components/layout/sidebar";
